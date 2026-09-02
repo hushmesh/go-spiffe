@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+// The mesh's workload attestation service.
+//
+// Field numbers and types come from the hand-written prost definitions in mesh-process
+// actors/actor-spiffe-agent/src/proto.rs. A divergence surfaces at the far end only as an
+// undiagnosable status 7, because the mesh answers one uniform refusal for every
+// request-derived failure.
+//
+// Unlike the relay's copy of this file (spire pkg/agent/meshattest/meshattestpb), the INNER
+// messages are defined here. The relay has no key for a sealed body and no business parsing
+// one; the workload is the end that seals and opens them.
+package hushmesh.api.server.workload.v1;
+
+option go_package = "github.com/spiffe/go-spiffe/v2/proto/hushmesh/workload/v1";
+
+service WorkloadAttestation {
+  rpc GetEnvelopeKey(GetEnvelopeKeyRequest) returns (GetEnvelopeKeyResponse);
+  rpc GetAttestationChallenge(SealedRequest) returns (SealedResponse);
+  rpc AttestWorkload(SealedRequest) returns (SealedResponse);
+}
+
+message SealedRequest {
+  uint32 suite = 1;
+  bytes recipient_key_id = 2;
+  // The ML-KEM ciphertext is only half of a hybrid agreement; sender_ecc_public_key_spki carries
+  // the other half.
+  bytes encapsulated_key = 3;
+  bytes ciphertext = 4;
+  bytes sender_ecc_public_key_spki = 5;
+}
+
+message SealedResponse {
+  uint32 suite = 1;
+  bytes ciphertext = 2;
+}
+
+message GetEnvelopeKeyRequest {}
+
+message GetEnvelopeKeyResponse {
+  bytes key_id = 1;
+  bytes ecc_public_key_spki = 2;
+  bytes mlkem_public_key = 3;
+  int64 expires_at = 4;
+  // Leaf first, issuer order after it.
+  repeated bytes cert_chain = 5;
+  // ECDSA P-384 over SHA-384, fixed r||s, over a hash chain folded one field at a time in
+  // ascending tag order: key_id, ecc_public_key_spki, mlkem_public_key, big-endian expires_at,
+  // then trust_domain as UTF-8. The relay never verifies it; the workload does.
+  bytes signature = 6;
+  // The entity's own stored trust domain, which the workload compares against the name it
+  // dialled. Signed at tag position 7, after the four fields above.
+  string trust_domain = 7;
+}
+
+message AttestationChallengeRequestInner {
+  string attestation_type = 1;
+  bytes client_request_id = 2;
+  int64 client_timestamp = 3;
+}
+
+message AttestationChallengeResponseInner {
+  bytes client_request_id = 1;
+  bytes challenge = 2;
+  bytes challenge_seed = 3;
+  bytes pcr_nonce = 4;
+  uint32 pcr_selection_bitfield = 5;
+  int64 expires_at = 6;
+}
+
+message AttestWorkloadRequestInner {
+  bytes challenge = 1;
+  bytes csr = 2;
+  string workload_uns_name = 3;
+  AttestationEvidence evidence = 4;
+  bytes client_request_id = 5;
+}
+
+message AttestWorkloadResponseInner {
+  bytes client_request_id = 1;
+  X509SVID svid = 2;
+  Bundle bundle = 3;
+}
+
+message AttestationEvidence {
+  bytes quote = 1;
+  bytes user_data = 2;
+  bytes var_data = 3;
+  uint32 var_data_operation = 4;
+  TpmQuoteEvidence tpm_quote = 5;
+}
+
+message TpmQuoteEvidence {
+  bytes report = 1;
+  bytes signature = 2;
+  repeated bytes pcr_values = 3;
+}
+
+message SPIFFEID {
+  string trust_domain = 1;
+  string path = 2;
+}
+
+message X509SVID {
+  repeated bytes cert_chain = 1;
+  SPIFFEID id = 2;
+  int64 expires_at = 3;
+  string hint = 4;
+}
+
+message X509Certificate {
+  bytes asn1 = 1;
+}
+
+message JWTKey {
+  bytes public_key = 1;
+  string key_id = 2;
+  int64 expires_at = 3;
+}
+
+message Bundle {
+  string trust_domain = 1;
+  repeated X509Certificate x509_authorities = 2;
+  repeated JWTKey jwt_authorities = 3;
+  int64 refresh_hint = 4;
+  uint64 sequence_number = 5;
+}
