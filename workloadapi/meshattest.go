@@ -161,7 +161,7 @@ func (c *Client) AttestMeshWorkload(ctx context.Context, params MeshAttestParams
 	if err != nil {
 		return nil, err
 	}
-	return buildMeshAttestation(issued, privateKey)
+	return buildMeshAttestation(issued, privateKey, params.TrustDomain)
 }
 
 // FetchMeshAdvertisementAnchor fetches the advertisement and returns the certificate a pin is
@@ -346,7 +346,7 @@ func generateWorkloadKeyAndCSR(workloadUNSName string) (*ecdsa.PrivateKey, []byt
 	return privateKey, csrDER, nil
 }
 
-func buildMeshAttestation(issued *meshattestpb.AttestWorkloadResponseInner, privateKey *ecdsa.PrivateKey) (*MeshAttestation, error) {
+func buildMeshAttestation(issued *meshattestpb.AttestWorkloadResponseInner, privateKey *ecdsa.PrivateKey, expectedTrustDomain spiffeid.TrustDomain) (*MeshAttestation, error) {
 	svid := issued.GetSvid()
 	if svid == nil {
 		return nil, errors.New("the mesh accepted the attestation but returned no SVID")
@@ -362,6 +362,18 @@ func buildMeshAttestation(issued *meshattestpb.AttestWorkloadResponseInner, priv
 	id, err := spiffeid.FromString(spiffeURIPrefix + svid.GetId().GetTrustDomain() + svid.GetId().GetPath())
 	if err != nil {
 		return nil, fmt.Errorf("the issued SVID names an unusable SPIFFE ID: %w", err)
+	}
+
+	// The response is AEAD-authenticated, so on its own this is belt-and-braces. It stops
+	// mattering that way the moment the channel is wrong: a certificate over a key this process
+	// does not hold is useless to it and would surface later as an unexplained handshake failure,
+	// far from the cause. Check it where the cause is visible.
+	public, ok := certificates[0].PublicKey.(*ecdsa.PublicKey)
+	if !ok || !public.Equal(&privateKey.PublicKey) {
+		return nil, errors.New("the issued certificate does not certify the key this workload generated")
+	}
+	if !id.MemberOf(expectedTrustDomain) {
+		return nil, fmt.Errorf("the issued SVID names trust domain %q, not the requested %q", id.TrustDomain(), expectedTrustDomain)
 	}
 
 	attestation := &MeshAttestation{

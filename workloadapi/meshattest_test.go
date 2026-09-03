@@ -439,7 +439,7 @@ func TestAdvertisementVerificationRefusesTheThingsItMust(t *testing.T) {
 	t.Run("an issuer that is not a CA", func(t *testing.T) {
 		fixture := newMeshAdvertisementFixture(t, agentFQDN, trustDomain)
 		leaf := fixture.response.CertChain[0]
-		err := verifyChainLinkage([][]byte{leaf, leaf})
+		err := verifyChainLinkage([][]byte{leaf, leaf}, time.Now())
 		assert.ErrorIs(t, err, ErrAdvertisementRefused,
 			"a signature check answers whether a signature verifies, never whether that key was allowed to sign certificates")
 	})
@@ -494,4 +494,61 @@ func certificatePEM(t *testing.T, der []byte) string {
 
 func hexString(raw []byte) string {
 	return hex.EncodeToString(raw)
+}
+
+// An expired certificate in the advertised chain must be refused. crypto/x509.CheckSignature does
+// not consult validity dates, and this package does not use Certificate.Verify, so nothing else in
+// the walk would catch it -- a relay holding any endpoint key that ever existed could otherwise
+// replay a retired leaf forever and receive the workload's sealed CSR and quote.
+func TestExpiredCertificateInTheAdvertisedChainIsRefused(t *testing.T) {
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiredDER, rootDER := expiredLeafUnderRoot(t, rootKey)
+
+	if err := verifyChainLinkage([][]byte{expiredDER, rootDER}, time.Now()); err == nil {
+		t.Fatal("an expired leaf must be refused; CheckSignature alone accepts it forever")
+	}
+	// The same chain, evaluated while the leaf was still valid, must pass -- otherwise the test
+	// proves only that something is broken, not that expiry is what was caught.
+	if err := verifyChainLinkage([][]byte{expiredDER, rootDER}, time.Now().Add(-48*time.Hour)); err != nil {
+		t.Fatalf("the chain must verify inside the leaf's validity window: %v", err)
+	}
+}
+
+func expiredLeafUnderRoot(t *testing.T, rootKey *ecdsa.PrivateKey) (leafDER, rootDER []byte) {
+	t.Helper()
+	rootTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "root"},
+		NotBefore:             time.Now().Add(-72 * time.Hour),
+		NotAfter:              time.Now().Add(72 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, &rootKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "retired leaf"},
+		NotBefore:    time.Now().Add(-72 * time.Hour),
+		NotAfter:     time.Now().Add(-1 * time.Hour),
+	}
+	leafDER, err = x509.CreateCertificate(rand.Reader, leafTemplate, root, &leafKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return leafDER, rootDER
 }

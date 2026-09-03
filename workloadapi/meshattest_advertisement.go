@@ -131,7 +131,7 @@ func verifyAdvertisement(resp *meshattestpb.GetEnvelopeKeyResponse, anchors *Mes
 	if _, err := advertisementLeaf(resp); err != nil {
 		return nil, err
 	}
-	if err := verifyChainToPinnedRoot(resp.GetCertChain(), anchors); err != nil {
+	if err := verifyChainToPinnedRoot(resp.GetCertChain(), anchors, now); err != nil {
 		return nil, err
 	}
 	if err := verifyAdvertisementExceptChainAnchor(resp, agentFQDN, expectedTrustDomain, now); err != nil {
@@ -169,7 +169,7 @@ func verifyAdvertisementExceptChainAnchor(resp *meshattestpb.GetEnvelopeKeyRespo
 	if err != nil {
 		return err
 	}
-	if err := verifyChainLinkage(resp.GetCertChain()); err != nil {
+	if err := verifyChainLinkage(resp.GetCertChain(), now); err != nil {
 		return err
 	}
 	if err := verifyLeafNamesTheAgent(leaf, agentFQDN); err != nil {
@@ -233,7 +233,35 @@ func advertisementChainTerminal(resp *meshattestpb.GetEnvelopeKeyResponse) (*x50
 //
 // The issuer test is applied to every element EXCEPT the first. The leaf is an end-entity endpoint
 // certificate that is correctly not a CA, so testing it would refuse every genuine advertisement.
-func verifyChainLinkage(chain [][]byte) error {
+// refuseExpiredCertificate rejects a certificate outside its validity period.
+//
+// crypto/x509.CheckSignature answers only "this signature verifies under that key" -- it never
+// consults NotBefore or NotAfter; only Certificate.Verify does, and this package deliberately does
+// not use it (the pinned SPKI set is the authority, not a system or bundle chain). So without this,
+// a retired agent endpoint leaf verifies forever.
+//
+// That matters because the advertisement is fetched THROUGH the relay, which is the party the
+// pinned-anchor design exists to defend against, and because the endpoint certificate is rotated by
+// design -- the mesh memoises its advertisement signature keyed on that certificate's expiry
+// precisely because renewal happens. Retired leaves therefore exist. Holding any endpoint key that
+// ever existed, a relay could otherwise serve [old_leaf, real_intermediate] with a fold signed
+// under the key it holds and pass every other check, and the workload would seal its CSR, UNS name
+// and quote to the relay's own envelope key.
+//
+// The mesh's own Rust client checks this: mesh_certificate_verify reaches wc_ParseCert(..., VERIFY),
+// wolfSSL's date-validating mode. Two implementations of one wire contract must not disagree about
+// whether an expired chain is acceptable.
+func refuseExpiredCertificate(certificate *x509.Certificate, position int, now time.Time) error {
+	if now.Before(certificate.NotBefore) {
+		return refusedAdvertisement("certificate %d in the advertised chain is not valid until %s", position, certificate.NotBefore)
+	}
+	if now.After(certificate.NotAfter) {
+		return refusedAdvertisement("certificate %d in the advertised chain expired at %s", position, certificate.NotAfter)
+	}
+	return nil
+}
+
+func verifyChainLinkage(chain [][]byte, now time.Time) error {
 	for i := 0; i+1 < len(chain); i++ {
 		child, err := x509.ParseCertificate(chain[i])
 		if err != nil {
@@ -242,6 +270,12 @@ func verifyChainLinkage(chain [][]byte) error {
 		issuer, err := x509.ParseCertificate(chain[i+1])
 		if err != nil {
 			return refusedAdvertisement("certificate %d in the advertised chain will not parse: %v", i+1, err)
+		}
+		if err := refuseExpiredCertificate(child, i, now); err != nil {
+			return err
+		}
+		if err := refuseExpiredCertificate(issuer, i+1, now); err != nil {
+			return err
 		}
 		if err := verifyIssuerMayIssue(issuer, i+1); err != nil {
 			return err
@@ -279,7 +313,7 @@ func verifyIssuerMayIssue(issuer *x509.Certificate, index int) error {
 // actors/actor-spiffe-agent/src/envelope_advertisement_handler.rs) and terminates at the shared
 // external intermediate rather than at a root -- so the last element is checked against a pinned
 // anchor rather than against itself.
-func verifyChainToPinnedRoot(chain [][]byte, anchors *MeshTrustAnchors) error {
+func verifyChainToPinnedRoot(chain [][]byte, anchors *MeshTrustAnchors, now time.Time) error {
 	pinnedRoots, err := anchors.pinnedRoots()
 	if err != nil {
 		return err
@@ -287,7 +321,7 @@ func verifyChainToPinnedRoot(chain [][]byte, anchors *MeshTrustAnchors) error {
 	if len(pinnedRoots) == 0 {
 		return refusedAdvertisement("none of the %d configured root certificates matches the %d pinned SPKI hashes", len(anchors.RootCertificates), len(anchors.PinnedRootSPKISHA256))
 	}
-	if err := verifyChainLinkage(chain); err != nil {
+	if err := verifyChainLinkage(chain, now); err != nil {
 		return err
 	}
 	if len(chain) == 0 {
@@ -297,6 +331,9 @@ func verifyChainToPinnedRoot(chain [][]byte, anchors *MeshTrustAnchors) error {
 	terminal, err := x509.ParseCertificate(chain[len(chain)-1])
 	if err != nil {
 		return refusedAdvertisement("advertisement chain terminal will not parse: %v", err)
+	}
+	if err := refuseExpiredCertificate(terminal, len(chain)-1, now); err != nil {
+		return err
 	}
 	if anchors.isPinned(terminal) {
 		return nil
