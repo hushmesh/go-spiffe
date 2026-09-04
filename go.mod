@@ -6,6 +6,7 @@ require (
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/fxamacker/cbor/v2 v2.9.0
 	github.com/go-jose/go-jose/v4 v4.1.3
+	github.com/google/go-tpm v0.9.8
 	github.com/stretchr/testify v1.10.0
 	google.golang.org/grpc v1.77.0
 	google.golang.org/grpc/examples v0.0.0-20250407062114-b368379ef8f6

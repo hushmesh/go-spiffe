@@ -2,8 +2,11 @@ package workloadapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"math/bits"
 	"time"
 
 	meshattestpb "github.com/spiffe/go-spiffe/v2/proto/hushmesh/workload/v1"
@@ -38,6 +41,9 @@ func (r *evidenceRequest) checkAnswerable(now time.Time) error {
 	if bytes.Equal(r.PCRNonce, make([]byte, meshIDLen)) {
 		return fmt.Errorf("challenge carries an all-zero pcr nonce")
 	}
+	if highest := 32 - bits.LeadingZeros32(r.PCRSelectionBitfield); highest > vtpmPCRSlotLimit {
+		return fmt.Errorf("challenge selects pcr slot %d, past slot %d, which a three-octet TPML_PCR_SELECTION cannot express", highest-1, vtpmPCRSlotLimit-1)
+	}
 	if r.ChallengeExpiresAt <= now.Unix() {
 		return fmt.Errorf("challenge expired at %d, before evidence could be produced at %d", r.ChallengeExpiresAt, now.Unix())
 	}
@@ -58,15 +64,89 @@ func meshReportData(nonce []byte, now time.Time) ([]byte, error) {
 	return data, nil
 }
 
+// evidenceSources are the three I/O leaves of evidence collection: the vTPM's HCL report, the
+// Azure IMDS quote over the TD report that report nests, and the vTPM's own PCR quote. They are
+// reached through this indirection so the assembly above them -- which is where the mesh's
+// byte-exact bindings are either satisfied or silently broken -- can be tested on a machine where
+// the leaves themselves cannot run at all.
+type evidenceSources struct {
+	hclReport func(reportData []byte) ([]byte, error)
+	tdQuote   func(ctx context.Context, tdReport []byte) ([]byte, error)
+	tpmQuote  func(nonce []byte, slots []int) (*tpmQuoteResult, error)
+}
+
+var liveEvidenceSources = evidenceSources{
+	hclReport: collectHCLReport,
+	tdQuote:   fetchTDQuote,
+	tpmQuote:  collectVTPMQuote,
+}
+
+// collectEvidence produces the real bundle: a TDX quote whose report data commits to the ADR-0041
+// nonce, the HCL variable data that commitment is the digest of, and a vTPM quote over exactly the
+// PCR slots this challenge selected.
+func collectEvidence(request *evidenceRequest, now time.Time) (*meshattestpb.AttestationEvidence, error) {
+	return collectEvidenceFrom(context.Background(), liveEvidenceSources, request, now)
+}
+
+func collectEvidenceFrom(ctx context.Context, sources evidenceSources, request *evidenceRequest, now time.Time) (*meshattestpb.AttestationEvidence, error) {
+	if err := request.checkAnswerable(now); err != nil {
+		return nil, err
+	}
+	userData, err := meshReportData(request.Nonce, now)
+	if err != nil {
+		return nil, err
+	}
+
+	// These 64 bytes are both what the vTPM is told to commit to and what travels as UserData. The
+	// mesh recomputes the fold and compares byte-exactly, so the two have to be the same value and
+	// not two constructions of it.
+	raw, err := sources.hclReport(userData)
+	if err != nil {
+		return nil, err
+	}
+	report, err := parseHCLReport(raw)
+	if err != nil {
+		return nil, err
+	}
+	tdReport, err := report.tdReport()
+	if err != nil {
+		return nil, err
+	}
+
+	// var_data carries both halves the mesh re-derives: the HCLAkPub the vTPM quote is verified
+	// against, and the user-data hex it compares to UserData. Declaring Sha256 over nothing would
+	// assert a digest the TD report cannot be carrying.
+	varData := report.varData()
+	if len(varData) == 0 {
+		return nil, errors.New("the hcl report carries no variable data, so it commits to no report data")
+	}
+
+	quote, err := sources.tdQuote(ctx, tdReport)
+	if err != nil {
+		return nil, err
+	}
+	tpmQuote, err := sources.tpmQuote(request.PCRNonce, pcrSlotsFromBitfield(request.PCRSelectionBitfield))
+	if err != nil {
+		return nil, err
+	}
+
+	return &meshattestpb.AttestationEvidence{
+		Quote:            quote,
+		UserData:         userData,
+		VarData:          varData,
+		VarDataOperation: varDataOperationSha256,
+		TpmQuote: &meshattestpb.TpmQuoteEvidence{
+			Report:    tpmQuote.report,
+			Signature: tpmQuote.signature,
+			PcrValues: tpmQuote.pcrValues,
+		},
+	}, nil
+}
+
 // stubEvidence exercises the envelope and the wire assembly off a TDX host. It cannot verify
 // anywhere, and it says so on the wire: varDataOperationAbsent with an empty var_data is the
 // honest encoding of "no quote here", where claiming Sha256 over nothing would assert a var_data
 // digest that was never computed.
-//
-// TODO: collect real evidence. It needs a TDX quote carrying this report data (Azure IMDS, or
-// /dev/tdx_guest) and a vTPM quote over PCRNonce for the slots PCRSelectionBitfield selects
-// (github.com/google/go-tpm), filling quote, var_data, var_data_operation and tpm_quote the way
-// evidence::collect does in mesh-process apps/app-workload-attester-demo/src/evidence.rs.
 func stubEvidence(request *evidenceRequest, now time.Time) (*meshattestpb.AttestationEvidence, error) {
 	if err := request.checkAnswerable(now); err != nil {
 		return nil, err

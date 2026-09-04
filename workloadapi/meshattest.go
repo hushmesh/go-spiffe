@@ -118,10 +118,12 @@ func (c *Client) AttestMeshWorkload(ctx context.Context, params MeshAttestParams
 		return nil, errors.New("mesh attestation needs the workload's UNS name; the mesh derives the nonce from the name as received")
 	}
 	// Before the first call rather than after the challenge: a challenge is single-use state on the
-	// mesh side, and spending one only to discover this build cannot answer it is a refusal the
+	// mesh side, and spending one only to discover this host cannot answer it is a refusal the
 	// caller would have to read out of a later, less specific failure.
 	if !params.StubEvidence {
-		return nil, errors.New("real TDX/vTPM evidence collection is not implemented in this client; set StubEvidence to exercise the path without a quote")
+		if err := checkVTPMReachable(); err != nil {
+			return nil, fmt.Errorf("this host cannot produce mesh TDX/vTPM evidence: %w; set StubEvidence to exercise the path without a quote", err)
+		}
 	}
 
 	advertisement, err := c.fetchMeshAdvertisement(ctx, params.Anchors, params.AgentFQDN, params.TrustDomain)
@@ -152,7 +154,11 @@ func (c *Client) AttestMeshWorkload(ctx context.Context, params MeshAttestParams
 		PCRSelectionBitfield: challenge.GetPcrSelectionBitfield(),
 		ChallengeExpiresAt:   challenge.GetExpiresAt(),
 	}
-	evidence, err := stubEvidence(request, time.Now())
+	collect := collectEvidence
+	if params.StubEvidence {
+		collect = stubEvidence
+	}
+	evidence, err := collect(request, time.Now())
 	if err != nil {
 		return nil, err
 	}
