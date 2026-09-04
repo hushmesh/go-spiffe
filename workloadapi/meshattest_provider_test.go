@@ -236,3 +236,49 @@ func TestReportDataIsTheValueBothHalvesOfTheBindingUse(t *testing.T) {
 	assert.Error(t, err)
 	assert.Error(t, request.CheckAnswerable(), "a short nonce cannot fill the field the quote commits to")
 }
+
+// UserData is the only field of the bundle the client can check for itself, and the first thing
+// CollectEvidence's contract asks for. A provider that gets it wrong otherwise spends a single-use
+// challenge to learn nothing.
+func TestUserDataThatIsNotTheDerivedReportDataIsRefusedLocally(t *testing.T) {
+	mesh := newFakeMesh(t)
+	address := serveFakeMesh(t, mesh)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client, err := New(ctx, WithAddr(address))
+	require.NoError(t, err)
+	defer client.Close()
+
+	attest := func(collect func(context.Context, *MeshEvidenceRequest) (*meshattestpb.AttestationEvidence, error)) error {
+		_, err := client.AttestMeshWorkload(ctx, MeshAttestParams{
+			AgentFQDN:         fakeMeshAgentFQDN,
+			TrustDomain:       spiffeid.RequireTrustDomainFromString(fakeMeshTrustDomain),
+			WorkloadUNSName:   fakeMeshUNSName,
+			Anchors:           mesh.anchors(),
+			EvidenceProviders: []MeshEvidenceProvider{&testProvider{name: "wrong-user-data", collect: collect}},
+		})
+		return err
+	}
+
+	err = attest(func(_ context.Context, request *MeshEvidenceRequest) (*meshattestpb.AttestationEvidence, error) {
+		userData, err := meshReportData(request.Nonce, request.CollectedAt.Add(-time.Hour))
+		if err != nil {
+			return nil, err
+		}
+		return &meshattestpb.AttestationEvidence{UserData: userData, VarDataOperation: varDataOperationSha256}, nil
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "wrong-user-data", "the refusal names the provider that produced it")
+	assert.Contains(t, err.Error(), "user data")
+
+	err = attest(func(context.Context, *MeshEvidenceRequest) (*meshattestpb.AttestationEvidence, error) {
+		return &meshattestpb.AttestationEvidence{VarDataOperation: varDataOperationSha256}, nil
+	})
+	assert.Error(t, err, "an omitted field is a divergence like any other")
+
+	err = attest(func(context.Context, *MeshEvidenceRequest) (*meshattestpb.AttestationEvidence, error) {
+		return nil, nil
+	})
+	assert.Error(t, err, "no evidence and no error is not a bundle")
+}

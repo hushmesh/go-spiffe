@@ -31,6 +31,11 @@ const (
 	imdsMaxResponseBytes = 1 << 20
 )
 
+// Proxy: nil, deliberately. http.DefaultClient honours HTTP_PROXY/ALL_PROXY and does not exempt
+// link-local addresses, so anything able to set this process's environment could redirect the TD
+// report to a host of its choosing. A metadata endpoint is never reached through a proxy.
+var imdsClient = &http.Client{Transport: &http.Transport{Proxy: nil}}
+
 type imdsReportBody struct {
 	Report string `json:"report"`
 }
@@ -56,7 +61,7 @@ func fetchTDQuote(ctx context.Context, tdReport []byte) ([]byte, error) {
 	}
 	request.Header.Set("Content-Type", "application/json")
 
-	response, err := http.DefaultClient.Do(request)
+	response, err := imdsClient.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("asking IMDS at %s for a td quote failed: %w", imdsTDQuoteEndpoint, err)
 	}

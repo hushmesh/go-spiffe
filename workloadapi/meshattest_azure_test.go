@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -407,4 +408,39 @@ func TestVTPMQuoteRefusesASelectionItCannotEncode(t *testing.T) {
 
 	_, err = vtpmQuote(nil, bytes.Repeat([]byte{2}, meshIDLen), nil)
 	assert.Error(t, err)
+}
+
+// The stale-report race: the firmware regenerates asynchronously and the report-data index is
+// shared, so a read can return a valid report carrying somebody else's nonce. Only this check
+// separates that from a forged quote, and it is the mesh's own comparison.
+func TestHCLReportCommitmentIsCheckedTheWayTheMeshChecksIt(t *testing.T) {
+	mine, err := meshReportData(bytes.Repeat([]byte{1}, meshIDLen), time.Now())
+	require.NoError(t, err)
+	theirs, err := meshReportData(bytes.Repeat([]byte{9}, meshIDLen), time.Now())
+	require.NoError(t, err)
+
+	report, err := parseHCLReport(newHCLReportFixture(t, mine, hclTDXReportType).raw)
+	require.NoError(t, err)
+	assert.NoError(t, report.commitsTo(mine))
+	assert.Error(t, report.commitsTo(theirs), "a report committing to another attestation's nonce is the race this catches")
+
+	upper := newHCLReportFixture(t, mine, hclTDXReportType)
+	upper.raw = bytes.ReplaceAll(upper.raw, []byte(hex.EncodeToString(mine)), []byte(strings.ToUpper(hex.EncodeToString(mine))))
+	report, err = parseHCLReport(upper.raw)
+	require.NoError(t, err)
+	assert.NoError(t, report.commitsTo(mine), "verify_quote_data compares case-insensitively, so hex case is not a race")
+
+	noVarData := make([]byte, hclAttestationReportSize)
+	binary.LittleEndian.PutUint32(noVarData[hclDataReportTypeOffset:], hclTDXReportType)
+	report, err = parseHCLReport(noVarData)
+	require.NoError(t, err)
+	assert.Error(t, report.commitsTo(mine))
+
+	garbage := make([]byte, hclAttestationReportSize+4)
+	binary.LittleEndian.PutUint32(garbage[hclDataReportTypeOffset:], hclTDXReportType)
+	binary.LittleEndian.PutUint32(garbage[hclDataVariableDataSizeOffset:], 4)
+	copy(garbage[hclAttestationReportSize:], "{{{{")
+	report, err = parseHCLReport(garbage)
+	require.NoError(t, err)
+	assert.Error(t, report.commitsTo(mine))
 }

@@ -24,6 +24,7 @@ import (
 	"io"
 	"math"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/google/go-tpm/legacy/tpm2"
@@ -77,25 +78,54 @@ func checkVTPMReachable() error {
 	return device.Close()
 }
 
+// hclReportLock serializes the write-wait-read below within this process. The report-data index is
+// one slot every attester on the host shares, so two overlapping collections would each commit the
+// other's nonce; the retry loop is what is left for the writers in other processes.
+var hclReportLock sync.Mutex
+
 // collectHCLReport writes the report data the quote must commit to, waits out the regeneration
-// window, and reads back the HCL report that now attests to it.
+// window, and reads the HCL report back -- then confirms the report it got is the one that write
+// produced, because a stale report is a valid report carrying the wrong nonce.
+//
+// Retrying redoes the whole sequence, which is the corrective action when another writer got in
+// between. It serializes nothing: this NV interface has no write-and-read-mine primitive, so
+// sustained contention exhausts the budget and returns a named error rather than a bad bundle.
 func collectHCLReport(reportData []byte) ([]byte, error) {
+	hclReportLock.Lock()
+	defer hclReportLock.Unlock()
+
 	device, err := openVTPM()
 	if err != nil {
 		return nil, err
 	}
 	defer device.Close()
 
-	if err := writeVTPMNVIndex(device, vtpmReportDataNVIndex, reportData); err != nil {
-		return nil, err
-	}
-	time.Sleep(vtpmGenerateReportDelay)
+	var stale error
+	for attempt := 1; attempt <= vtpmMaxQuoteRetries; attempt++ {
+		if err := writeVTPMNVIndex(device, vtpmReportDataNVIndex, reportData); err != nil {
+			return nil, err
+		}
+		time.Sleep(vtpmGenerateReportDelay)
 
-	report, err := tpm2.NVReadEx(device, vtpmHCLReportNVIndex, tpm2.HandleOwner, "", 0)
-	if err != nil {
-		return nil, fmt.Errorf("reading the HCL report from nv index %#x failed: %w", uint32(vtpmHCLReportNVIndex), err)
+		raw, err := tpm2.NVReadEx(device, vtpmHCLReportNVIndex, tpm2.HandleOwner, "", 0)
+		if err != nil {
+			return nil, fmt.Errorf("reading the HCL report from nv index %#x failed: %w", uint32(vtpmHCLReportNVIndex), err)
+		}
+		// A report that will not parse is not a race and will not parse next time either.
+		report, err := parseHCLReport(raw)
+		if err != nil {
+			return nil, err
+		}
+		if err := report.commitsTo(reportData); err != nil {
+			stale = fmt.Errorf("%w, after %d of %d attempts", err, attempt, vtpmMaxQuoteRetries)
+			continue
+		}
+		return raw, nil
 	}
-	return report, nil
+	if stale == nil {
+		stale = errors.New("no hcl report was read")
+	}
+	return nil, stale
 }
 
 func writeVTPMNVIndex(device io.ReadWriter, index tpmutil.Handle, data []byte) error {

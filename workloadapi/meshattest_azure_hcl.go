@@ -2,7 +2,11 @@ package workloadapi
 
 import (
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 )
 
 // The Azure HCL report layout, ported field for field from HclReport and TdReport in mesh-process
@@ -90,6 +94,28 @@ func parseHCLReport(raw []byte) (*hclReport, error) {
 // the TD report's report_data is the SHA-256 of.
 func (r *hclReport) varData() []byte {
 	return r.raw[hclAttestationReportSize : hclAttestationReportSize+r.variableDataSize]
+}
+
+// commitsTo answers whether this report is the one a given write produced. The firmware regenerates
+// asynchronously and the report-data index is shared, so a read can return a valid previous report
+// committing to another attestation's nonce, which the mesh refuses without naming the race.
+func (r *hclReport) commitsTo(reportData []byte) error {
+	varData := r.varData()
+	if len(varData) == 0 {
+		return errors.New("the hcl report carries no variable data, so it commits to no report data")
+	}
+	var declared struct {
+		UserData string `json:"user-data"`
+	}
+	if err := json.Unmarshal(varData, &declared); err != nil {
+		return fmt.Errorf("the hcl report's variable data will not decode as JSON: %w", err)
+	}
+	// verify_quote_data compares this with eq_ignore_ascii_case, so a report whose firmware chose
+	// the other hex case is this attestation's report and not a stale one.
+	if !strings.EqualFold(declared.UserData, hex.EncodeToString(reportData)) {
+		return errors.New("the hcl report commits to report data this attestation did not write")
+	}
+	return nil
 }
 
 // tdReport is the nested TD report, which is what Azure IMDS turns into a quote. It is returned as

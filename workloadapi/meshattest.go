@@ -174,6 +174,16 @@ func (c *Client) AttestMeshWorkload(ctx context.Context, params MeshAttestParams
 	if evidence == nil {
 		return nil, fmt.Errorf("evidence provider %q returned no evidence and no error", provider.Name())
 	}
+	// The one field of the bundle that is a pure function of values already in hand, and the first
+	// obligation CollectEvidence documents. The mesh recomputes it and refuses a divergence with a
+	// status that names nothing, having already spent the challenge to say so.
+	expectedUserData, err := request.ReportData()
+	if err != nil {
+		return nil, err
+	}
+	if !bytesEqual(evidence.GetUserData(), expectedUserData) {
+		return nil, fmt.Errorf("evidence provider %q returned %d bytes of user data that are not the report data this challenge derives", provider.Name(), len(evidence.GetUserData()))
+	}
 
 	issued, err := c.attestMeshWorkload(ctx, advertisement, challenge, params.WorkloadUNSName, csrDER, evidence)
 	if err != nil {

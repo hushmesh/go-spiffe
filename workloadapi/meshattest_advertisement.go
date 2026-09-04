@@ -169,6 +169,9 @@ func verifyAdvertisementExceptChainAnchor(resp *meshattestpb.GetEnvelopeKeyRespo
 	if err != nil {
 		return err
 	}
+	if err := refuseExpiredCertificate(leaf, 0, now); err != nil {
+		return err
+	}
 	if err := verifyChainLinkage(resp.GetCertChain(), now); err != nil {
 		return err
 	}
