@@ -135,11 +135,12 @@ func TestParseHCLReportRefusesWhatItCannotAccountFor(t *testing.T) {
 
 func TestCollectedEvidenceCarriesTheBindingsTheMeshRecomputes(t *testing.T) {
 	now := time.Now()
-	request := &evidenceRequest{
+	request := &MeshEvidenceRequest{
 		Nonce:                bytes.Repeat([]byte{1}, meshIDLen),
 		PCRNonce:             bytes.Repeat([]byte{2}, meshIDLen),
 		PCRSelectionBitfield: 0x1_ffff,
 		ChallengeExpiresAt:   now.Unix() + 120,
+		CollectedAt:          now,
 	}
 	expectedUserData, err := meshReportData(request.Nonce, now)
 	require.NoError(t, err)
@@ -168,7 +169,7 @@ func TestCollectedEvidenceCarriesTheBindingsTheMeshRecomputes(t *testing.T) {
 		},
 	}
 
-	evidence, err := collectEvidenceFrom(context.Background(), sources, request, now)
+	evidence, err := azureTDXVTPMProvider{sources: sources}.CollectEvidence(context.Background(), request)
 	require.NoError(t, err)
 
 	assert.Equal(t, expectedUserData, committedTo, "the vTPM must be told to commit to the same bytes that travel as UserData")
@@ -203,25 +204,26 @@ func TestCollectedEvidenceRefusesAnUnanswerableChallengeBeforeSpendingAQuote(t *
 			return nil, nil
 		},
 	}
-	expired := &evidenceRequest{
+	expired := &MeshEvidenceRequest{
 		Nonce:                bytes.Repeat([]byte{1}, meshIDLen),
 		PCRNonce:             bytes.Repeat([]byte{2}, meshIDLen),
 		PCRSelectionBitfield: 0x1_ffff,
 		ChallengeExpiresAt:   now.Unix() - 1,
+		CollectedAt:          now,
 	}
-	_, err := collectEvidenceFrom(context.Background(), refuseToRun, expired, now)
+	_, err := azureTDXVTPMProvider{sources: refuseToRun}.CollectEvidence(context.Background(), expired)
 	assert.Error(t, err)
 
 	noSlots := *expired
 	noSlots.ChallengeExpiresAt = now.Unix() + 120
 	noSlots.PCRSelectionBitfield = 0
-	_, err = collectEvidenceFrom(context.Background(), refuseToRun, &noSlots, now)
+	_, err = azureTDXVTPMProvider{sources: refuseToRun}.CollectEvidence(context.Background(), &noSlots)
 	assert.Error(t, err)
 
 	unencodable := *expired
 	unencodable.ChallengeExpiresAt = now.Unix() + 120
 	unencodable.PCRSelectionBitfield = 1 << 24
-	_, err = collectEvidenceFrom(context.Background(), refuseToRun, &unencodable, now)
+	_, err = azureTDXVTPMProvider{sources: refuseToRun}.CollectEvidence(context.Background(), &unencodable)
 	assert.Error(t, err)
 }
 
@@ -230,19 +232,18 @@ func TestCollectedEvidenceRefusesAnUnanswerableChallengeBeforeSpendingAQuote(t *
 // is single-use mesh state, and spending one to learn this would make the reason unreadable.
 func TestASelectionThisBuildCannotEncodeIsUnanswerable(t *testing.T) {
 	now := time.Now()
-	request := &evidenceRequest{
+	request := &MeshEvidenceRequest{
 		Nonce:                bytes.Repeat([]byte{1}, meshIDLen),
 		PCRNonce:             bytes.Repeat([]byte{2}, meshIDLen),
 		PCRSelectionBitfield: 1 << 23,
 		ChallengeExpiresAt:   now.Unix() + 120,
+		CollectedAt:          now,
 	}
-	require.NoError(t, request.checkAnswerable(now), "slot 23 is the last one three octets hold")
+	require.NoError(t, request.CheckAnswerable())
+	require.NoError(t, checkQuotableSelection(request.PCRSelectionBitfield), "slot 23 is the last one three octets hold")
 
-	request.PCRSelectionBitfield = 1 << 24
-	assert.Error(t, request.checkAnswerable(now))
-
-	request.PCRSelectionBitfield = 0x1_ffff | (1 << 31)
-	assert.Error(t, request.checkAnswerable(now), "one out-of-range slot makes the whole selection unquotable")
+	assert.Error(t, checkQuotableSelection(1<<24))
+	assert.Error(t, checkQuotableSelection(0x1_ffff|(1<<31)), "one out-of-range slot makes the whole selection unquotable")
 }
 
 func TestCollectedEvidenceRefusesAReportWithNoVariableData(t *testing.T) {
@@ -258,12 +259,13 @@ func TestCollectedEvidenceRefusesAReportWithNoVariableData(t *testing.T) {
 		},
 		tpmQuote: func([]byte, []int) (*tpmQuoteResult, error) { return nil, nil },
 	}
-	_, err := collectEvidenceFrom(context.Background(), sources, &evidenceRequest{
+	_, err := azureTDXVTPMProvider{sources: sources}.CollectEvidence(context.Background(), &MeshEvidenceRequest{
 		Nonce:                bytes.Repeat([]byte{1}, meshIDLen),
 		PCRNonce:             bytes.Repeat([]byte{2}, meshIDLen),
 		PCRSelectionBitfield: 0x1_ffff,
 		ChallengeExpiresAt:   now.Unix() + 120,
-	}, now)
+		CollectedAt:          now,
+	})
 	assert.Error(t, err, "declaring Sha256 over an absent var_data would assert a digest nothing computed")
 }
 

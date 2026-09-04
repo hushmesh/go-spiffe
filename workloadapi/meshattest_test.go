@@ -2,6 +2,7 @@ package workloadapi
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -262,14 +263,15 @@ func TestWorkloadCSRCommonNameIsTheLastBytesOfTheUNSName(t *testing.T) {
 
 func TestStubEvidenceDeclaresAbsentRatherThanClaimingADigest(t *testing.T) {
 	now := time.Now()
-	request := &evidenceRequest{
+	request := &MeshEvidenceRequest{
 		Nonce:                bytes.Repeat([]byte{1}, meshIDLen),
 		PCRNonce:             bytes.Repeat([]byte{2}, meshIDLen),
 		PCRSelectionBitfield: 0x1_ffff,
 		ChallengeExpiresAt:   now.Unix() + 120,
+		CollectedAt:          now,
 	}
 
-	evidence, err := stubEvidence(request, now)
+	evidence, err := stubEvidenceProvider{}.CollectEvidence(context.Background(), request)
 	require.NoError(t, err)
 	assert.EqualValues(t, varDataOperationAbsent, evidence.GetVarDataOperation())
 	assert.Empty(t, evidence.GetVarData())
@@ -285,28 +287,29 @@ func TestStubEvidenceDeclaresAbsentRatherThanClaimingADigest(t *testing.T) {
 
 func TestUnanswerableChallengeIsRefusedBeforeAQuoteIsSpent(t *testing.T) {
 	now := time.Now()
-	answerable := func() *evidenceRequest {
-		return &evidenceRequest{
+	answerable := func() *MeshEvidenceRequest {
+		return &MeshEvidenceRequest{
 			Nonce:                bytes.Repeat([]byte{1}, meshIDLen),
 			PCRNonce:             bytes.Repeat([]byte{2}, meshIDLen),
 			PCRSelectionBitfield: 0x1_ffff,
 			ChallengeExpiresAt:   now.Unix() + 120,
+			CollectedAt:          now,
 		}
 	}
-	require.NoError(t, answerable().checkAnswerable(now))
+	require.NoError(t, answerable().CheckAnswerable())
 
 	noSlots := answerable()
 	noSlots.PCRSelectionBitfield = 0
-	assert.Error(t, noSlots.checkAnswerable(now))
+	assert.Error(t, noSlots.CheckAnswerable())
 
 	zeroNonce := answerable()
 	zeroNonce.PCRNonce = make([]byte, meshIDLen)
-	assert.Error(t, zeroNonce.checkAnswerable(now))
+	assert.Error(t, zeroNonce.CheckAnswerable())
 
 	expired := answerable()
 	expired.ChallengeExpiresAt = now.Unix() - 1
-	assert.Error(t, expired.checkAnswerable(now))
-	_, err := stubEvidence(expired, now)
+	assert.Error(t, expired.CheckAnswerable())
+	_, err := stubEvidenceProvider{}.CollectEvidence(context.Background(), expired)
 	assert.Error(t, err, "a bypass here would let the stub reach the wire on a challenge a quote could not")
 }
 

@@ -84,8 +84,15 @@ type MeshAttestParams struct {
 
 	// StubEvidence sends an empty evidence bundle instead of a real quote. It cannot pass
 	// verification against a production mesh; it exists to exercise the envelope and the wire
-	// assembly off a TDX host.
+	// assembly off a TDX host. It is an explicit opt-in and is never selected by detection.
 	StubEvidence bool
+
+	// EvidenceProviders overrides which platforms this client will attest from, in preference
+	// order; the first whose Available reports the host can use it is the one that collects. Nil
+	// means BuiltinMeshEvidenceProviders. A one-element slice pins exactly one provider, and a
+	// caller wanting its own considered ahead of the built-ins prepends to that slice. Setting
+	// this together with StubEvidence is refused rather than silently resolved.
+	EvidenceProviders []MeshEvidenceProvider
 }
 
 // MeshAttestation is what the mesh issued.
@@ -119,11 +126,11 @@ func (c *Client) AttestMeshWorkload(ctx context.Context, params MeshAttestParams
 	}
 	// Before the first call rather than after the challenge: a challenge is single-use state on the
 	// mesh side, and spending one only to discover this host cannot answer it is a refusal the
-	// caller would have to read out of a later, less specific failure.
-	if !params.StubEvidence {
-		if err := checkVTPMReachable(); err != nil {
-			return nil, fmt.Errorf("this host cannot produce mesh TDX/vTPM evidence: %w; set StubEvidence to exercise the path without a quote", err)
-		}
+	// caller would have to read out of a later, less specific failure. Selection is the same pass:
+	// a provider is chosen by the availability check that would have gated it anyway.
+	provider, err := resolveMeshEvidenceProvider(params)
+	if err != nil {
+		return nil, err
 	}
 
 	advertisement, err := c.fetchMeshAdvertisement(ctx, params.Anchors, params.AgentFQDN, params.TrustDomain)
@@ -136,7 +143,7 @@ func (c *Client) AttestMeshWorkload(ctx context.Context, params MeshAttestParams
 		return nil, err
 	}
 
-	challenge, err := c.requestMeshAttestationChallenge(ctx, advertisement)
+	challenge, err := c.requestMeshAttestationChallenge(ctx, advertisement, provider.AttestationType())
 	if err != nil {
 		return nil, err
 	}
@@ -146,21 +153,26 @@ func (c *Client) AttestMeshWorkload(ctx context.Context, params MeshAttestParams
 		return nil, err
 	}
 
-	request := &evidenceRequest{
+	request := &MeshEvidenceRequest{
 		Nonce:    nonce,
 		PCRNonce: challenge.GetPcrNonce(),
 		// The mesh seals PcrSelection::Range { pcr_max_inclusive: 16 } and compares the vTPM quote
 		// against the bitfield it widens to, so the wire bitfield selects the identical slots.
 		PCRSelectionBitfield: challenge.GetPcrSelectionBitfield(),
 		ChallengeExpiresAt:   challenge.GetExpiresAt(),
+		CollectedAt:          time.Now(),
 	}
-	collect := collectEvidence
-	if params.StubEvidence {
-		collect = stubEvidence
-	}
-	evidence, err := collect(request, time.Now())
-	if err != nil {
+	// Checked here as well as inside the provider: a third-party provider that skips its own gate
+	// would otherwise spend the challenge on a bundle that was never answerable.
+	if err := request.CheckAnswerable(); err != nil {
 		return nil, err
+	}
+	evidence, err := provider.CollectEvidence(ctx, request)
+	if err != nil {
+		return nil, fmt.Errorf("evidence provider %q could not attest: %w", provider.Name(), err)
+	}
+	if evidence == nil {
+		return nil, fmt.Errorf("evidence provider %q returned no evidence and no error", provider.Name())
 	}
 
 	issued, err := c.attestMeshWorkload(ctx, advertisement, challenge, params.WorkloadUNSName, csrDER, evidence)
@@ -200,7 +212,7 @@ func (c *Client) fetchMeshAdvertisement(ctx context.Context, anchors *MeshTrustA
 	return verifyAdvertisement(resp, anchors, agentFQDN, trustDomain.Name(), time.Now())
 }
 
-func (c *Client) requestMeshAttestationChallenge(ctx context.Context, advertisement *verifiedAdvertisement) (*meshattestpb.AttestationChallengeResponseInner, error) {
+func (c *Client) requestMeshAttestationChallenge(ctx context.Context, advertisement *verifiedAdvertisement, attestationType string) (*meshattestpb.AttestationChallengeResponseInner, error) {
 	session, err := establishEnvelopeSession(advertisement, getAttestationChallengePath)
 	if err != nil {
 		return nil, err
@@ -211,7 +223,7 @@ func (c *Client) requestMeshAttestationChallenge(ctx context.Context, advertisem
 	}
 
 	inner, err := proto.Marshal(&meshattestpb.AttestationChallengeRequestInner{
-		AttestationType: attestationTypeMeshTdxVtpm,
+		AttestationType: attestationType,
 		ClientRequestId: clientRequestID,
 		ClientTimestamp: time.Now().Unix(),
 	})

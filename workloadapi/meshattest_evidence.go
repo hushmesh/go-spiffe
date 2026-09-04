@@ -1,37 +1,53 @@
+// The values every mesh workload evidence bundle is built from, independent of the platform that
+// produces it: the challenge-derived request a provider is handed, and the 64 bytes of report data
+// the hardware quote has to commit to.
+
 package workloadapi
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"math/bits"
 	"time"
-
-	meshattestpb "github.com/spiffe/go-spiffe/v2/proto/hushmesh/workload/v1"
 )
 
 // reportDataLen is the width of the SGX/TDX REPORTDATA field the mesh's ReportData occupies:
 // nonce (32) || unix_timestamp (8) || reserved1 (24).
 const reportDataLen = 64
 
-// evidenceRequest holds the values a workload may not choose for itself. Nonce is the ADR-0041
+// MeshEvidenceRequest holds the values a workload may not choose for itself. Nonce is the ADR-0041
 // fold output; PCRNonce and PCRSelectionBitfield come out of the sealed challenge because they are
 // the verifier's own choices and it compares the vTPM quote against them (ADR-0042 Decision 2).
-// ChallengeExpiresAt rides along so the freshness gate sits with the other gates.
-type evidenceRequest struct {
-	Nonce                []byte
+// ChallengeExpiresAt and CollectedAt ride along so the freshness gates sit with the other gates.
+type MeshEvidenceRequest struct {
+	// Nonce is the 32 bytes the quote's report data must commit to.
+	Nonce []byte
+
+	// PCRNonce is the qualifying data the vTPM quote must carry, and PCRSelectionBitfield names
+	// the PCR slots it must cover -- exactly those, since the mesh compares the quoted selection
+	// against the bitfield it sealed into the challenge.
 	PCRNonce             []byte
 	PCRSelectionBitfield uint32
-	ChallengeExpiresAt   int64
+
+	// ChallengeExpiresAt is the unix second past which the mesh will not accept this challenge.
+	ChallengeExpiresAt int64
+
+	// CollectedAt is the wall clock the report data commits to. It is set once, when the challenge
+	// is answered, so that a bundle built early and sent late fails on freshness rather than on the
+	// binding; the mesh accepts a report timestamp within TIMESTAMP_EXPIRATION_SECONDS (120) of its
+	// own clock.
+	CollectedAt time.Time
 }
 
-// checkAnswerable rejects every reason this challenge cannot produce an acceptable quote, before a
-// quote is spent on it. A TDX quote plus a vTPM quote is seconds of work and an IMDS round trip,
-// and the answer to all of these is the same uniform refusal a genuine binding mismatch gives --
-// so failing here is the only place the reason is legible.
-func (r *evidenceRequest) checkAnswerable(now time.Time) error {
+// CheckAnswerable rejects every reason this challenge cannot produce an acceptable quote, before a
+// quote is spent on it. A hardware quote is seconds of work and a round trip, and the answer to
+// all of these is the same uniform refusal a genuine binding mismatch gives -- so failing here is
+// the only place the reason is legible. A provider calls it first; the client calls it too, so
+// that a provider which forgets cannot reach the wire with a bundle that was never answerable.
+func (r *MeshEvidenceRequest) CheckAnswerable() error {
+	if len(r.Nonce) != meshIDLen {
+		return fmt.Errorf("challenge nonce is %d bytes, not %d", len(r.Nonce), meshIDLen)
+	}
 	if r.PCRSelectionBitfield == 0 {
 		return fmt.Errorf("challenge selects no pcr slots")
 	}
@@ -41,19 +57,24 @@ func (r *evidenceRequest) checkAnswerable(now time.Time) error {
 	if bytes.Equal(r.PCRNonce, make([]byte, meshIDLen)) {
 		return fmt.Errorf("challenge carries an all-zero pcr nonce")
 	}
-	if highest := 32 - bits.LeadingZeros32(r.PCRSelectionBitfield); highest > vtpmPCRSlotLimit {
-		return fmt.Errorf("challenge selects pcr slot %d, past slot %d, which a three-octet TPML_PCR_SELECTION cannot express", highest-1, vtpmPCRSlotLimit-1)
-	}
-	if r.ChallengeExpiresAt <= now.Unix() {
-		return fmt.Errorf("challenge expired at %d, before evidence could be produced at %d", r.ChallengeExpiresAt, now.Unix())
+	if r.ChallengeExpiresAt <= r.CollectedAt.Unix() {
+		return fmt.Errorf("challenge expired at %d, before evidence could be produced at %d", r.ChallengeExpiresAt, r.CollectedAt.Unix())
 	}
 	return nil
 }
 
-// meshReportData is ReportData in crates/crate-common-types/src/attestation.rs: a #[repr(C,
-// packed)] struct of nonce, a native-endian i64 wall-clock second, and 24 reserved zero bytes that
-// verify_quote_data rejects if non-zero. Generating it early and sending it late fails on
-// freshness rather than on the binding, so it is built at the moment the evidence is.
+// ReportData is the 64 bytes the hardware quote must commit to: ReportData in mesh-process
+// crates/crate-common-types/src/attestation.rs, a #[repr(C, packed)] struct of the nonce, a
+// native-endian i64 wall-clock second, and 24 reserved zero bytes that verify_quote_data rejects
+// if non-zero.
+//
+// A provider must put THESE bytes in the quote and send THESE bytes as AttestationEvidence.UserData
+// -- the same value, not two constructions of it. The mesh recomputes the fold and compares
+// byte-exactly, and a mismatch is indistinguishable on the wire from a forged quote.
+func (r *MeshEvidenceRequest) ReportData() ([]byte, error) {
+	return meshReportData(r.Nonce, r.CollectedAt)
+}
+
 func meshReportData(nonce []byte, now time.Time) ([]byte, error) {
 	if len(nonce) != meshIDLen {
 		return nil, fmt.Errorf("report data nonce is %d bytes, not %d", len(nonce), meshIDLen)
@@ -62,104 +83,4 @@ func meshReportData(nonce []byte, now time.Time) ([]byte, error) {
 	copy(data, nonce)
 	binary.LittleEndian.PutUint64(data[meshIDLen:meshIDLen+8], uint64(now.Unix()))
 	return data, nil
-}
-
-// evidenceSources are the three I/O leaves of evidence collection: the vTPM's HCL report, the
-// Azure IMDS quote over the TD report that report nests, and the vTPM's own PCR quote. They are
-// reached through this indirection so the assembly above them -- which is where the mesh's
-// byte-exact bindings are either satisfied or silently broken -- can be tested on a machine where
-// the leaves themselves cannot run at all.
-type evidenceSources struct {
-	hclReport func(reportData []byte) ([]byte, error)
-	tdQuote   func(ctx context.Context, tdReport []byte) ([]byte, error)
-	tpmQuote  func(nonce []byte, slots []int) (*tpmQuoteResult, error)
-}
-
-var liveEvidenceSources = evidenceSources{
-	hclReport: collectHCLReport,
-	tdQuote:   fetchTDQuote,
-	tpmQuote:  collectVTPMQuote,
-}
-
-// collectEvidence produces the real bundle: a TDX quote whose report data commits to the ADR-0041
-// nonce, the HCL variable data that commitment is the digest of, and a vTPM quote over exactly the
-// PCR slots this challenge selected.
-func collectEvidence(request *evidenceRequest, now time.Time) (*meshattestpb.AttestationEvidence, error) {
-	return collectEvidenceFrom(context.Background(), liveEvidenceSources, request, now)
-}
-
-func collectEvidenceFrom(ctx context.Context, sources evidenceSources, request *evidenceRequest, now time.Time) (*meshattestpb.AttestationEvidence, error) {
-	if err := request.checkAnswerable(now); err != nil {
-		return nil, err
-	}
-	userData, err := meshReportData(request.Nonce, now)
-	if err != nil {
-		return nil, err
-	}
-
-	// These 64 bytes are both what the vTPM is told to commit to and what travels as UserData. The
-	// mesh recomputes the fold and compares byte-exactly, so the two have to be the same value and
-	// not two constructions of it.
-	raw, err := sources.hclReport(userData)
-	if err != nil {
-		return nil, err
-	}
-	report, err := parseHCLReport(raw)
-	if err != nil {
-		return nil, err
-	}
-	tdReport, err := report.tdReport()
-	if err != nil {
-		return nil, err
-	}
-
-	// var_data carries both halves the mesh re-derives: the HCLAkPub the vTPM quote is verified
-	// against, and the user-data hex it compares to UserData. Declaring Sha256 over nothing would
-	// assert a digest the TD report cannot be carrying.
-	varData := report.varData()
-	if len(varData) == 0 {
-		return nil, errors.New("the hcl report carries no variable data, so it commits to no report data")
-	}
-
-	quote, err := sources.tdQuote(ctx, tdReport)
-	if err != nil {
-		return nil, err
-	}
-	tpmQuote, err := sources.tpmQuote(request.PCRNonce, pcrSlotsFromBitfield(request.PCRSelectionBitfield))
-	if err != nil {
-		return nil, err
-	}
-
-	return &meshattestpb.AttestationEvidence{
-		Quote:            quote,
-		UserData:         userData,
-		VarData:          varData,
-		VarDataOperation: varDataOperationSha256,
-		TpmQuote: &meshattestpb.TpmQuoteEvidence{
-			Report:    tpmQuote.report,
-			Signature: tpmQuote.signature,
-			PcrValues: tpmQuote.pcrValues,
-		},
-	}, nil
-}
-
-// stubEvidence exercises the envelope and the wire assembly off a TDX host. It cannot verify
-// anywhere, and it says so on the wire: varDataOperationAbsent with an empty var_data is the
-// honest encoding of "no quote here", where claiming Sha256 over nothing would assert a var_data
-// digest that was never computed.
-func stubEvidence(request *evidenceRequest, now time.Time) (*meshattestpb.AttestationEvidence, error) {
-	if err := request.checkAnswerable(now); err != nil {
-		return nil, err
-	}
-	userData, err := meshReportData(request.Nonce, now)
-	if err != nil {
-		return nil, err
-	}
-	return &meshattestpb.AttestationEvidence{
-		Quote:            nil,
-		UserData:         userData,
-		VarData:          nil,
-		VarDataOperation: varDataOperationAbsent,
-		TpmQuote:         nil,
-	}, nil
 }
