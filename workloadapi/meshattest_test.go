@@ -241,24 +241,16 @@ func TestEnvelopeSessionDerivesTheHybridSecretTheMeshWillDerive(t *testing.T) {
 	assert.Equal(t, []byte("issued svid"), opened)
 }
 
-func TestWorkloadCSRCommonNameIsTheLastBytesOfTheUNSName(t *testing.T) {
-	longName := "in.mesh.org21." + string(bytes.Repeat([]byte{'a'}, 200))
-	_, csrDER, err := generateWorkloadKeyAndCSR(longName)
+func TestWorkloadCSRNamesNoSubject(t *testing.T) {
+	_, csrDER, err := generateWorkloadKeyAndCSR()
 	require.NoError(t, err)
 
 	csr, err := x509.ParseCertificateRequest(csrDER)
 	require.NoError(t, err)
 	require.NoError(t, csr.CheckSignature())
-	assert.Len(t, csr.Subject.CommonName, maxCertCommonNameLen)
-	assert.Equal(t, longName[len(longName)-maxCertCommonNameLen:], csr.Subject.CommonName,
-		"identity travels in the URI SAN the mesh adds; the CN is decoration bounded by wolfSSL's CTC_NAME_SIZE")
-
-	shortName := "in.mesh.org21.svc"
-	_, csrDER, err = generateWorkloadKeyAndCSR(shortName)
-	require.NoError(t, err)
-	csr, err = x509.ParseCertificateRequest(csrDER)
-	require.NoError(t, err)
-	assert.Equal(t, shortName, csr.Subject.CommonName)
+	assert.Empty(t, csr.Subject.CommonName,
+		"the mesh refuses an SVID request carrying a subject CN, so a CN here fails every attestation")
+	assert.Empty(t, csr.Subject.Names)
 }
 
 func TestStubEvidenceDeclaresAbsentRatherThanClaimingADigest(t *testing.T) {

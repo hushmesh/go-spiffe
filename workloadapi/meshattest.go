@@ -24,7 +24,6 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"time"
@@ -54,11 +53,6 @@ const (
 	relayBusyRetries        = 5
 	relayBusyBackoffInitial = 100 * time.Millisecond
 )
-
-// maxCertCommonNameLen is MAX_CERT_COMMON_NAME_LEN (crates/crate-common-crypto/src/certificate.rs),
-// which is wolfSSL's CTC_NAME_SIZE. A workload UNS name is bounded at 512, so the full name does
-// not fit and the issuer refuses a longer CN with a status that names nothing.
-const maxCertCommonNameLen = 63
 
 // MeshAttestParams is what a workload must know before it can ask for its first SVID. None of it
 // is discoverable from the relay: the trust domain and the agent fqdn are what the advertisement
@@ -138,7 +132,7 @@ func (c *Client) AttestMeshWorkload(ctx context.Context, params MeshAttestParams
 		return nil, err
 	}
 
-	privateKey, csrDER, err := generateWorkloadKeyAndCSR(params.WorkloadUNSName)
+	privateKey, csrDER, err := generateWorkloadKeyAndCSR()
 	if err != nil {
 		return nil, err
 	}
@@ -348,28 +342,20 @@ func (c *Client) invokeMesh(ctx context.Context, path string, req, resp proto.Me
 // sign. The CSR's DER is what the quote commits to and what the issuer signs over, so it is carried
 // as DER from here to the wire without a PEM round trip: re-encoding it anywhere between would
 // change the derived nonce and the mesh would refuse with no indication why.
-func generateWorkloadKeyAndCSR(workloadUNSName string) (*ecdsa.PrivateKey, []byte, error) {
+func generateWorkloadKeyAndCSR() (*ecdsa.PrivateKey, []byte, error) {
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generating the workload P-256 key failed: %w", err)
 	}
 
-	// The CN is decoration: the mesh takes the identity from its own registration and puts it in
-	// the URI SAN, and sign_entity_svid refuses a CN past this same ceiling. A UNS name is bounded
-	// at MAX_WORKLOAD_UNS_NAME_LEN (512), so the full name does not fit and wolfSSL refuses it with
-	// a status that names nothing. UNS names are ASCII by normalize_workload_uns_name, so a byte
-	// cut is a character cut.
-	commonName := workloadUNSName
-	if len(commonName) > maxCertCommonNameLen {
-		commonName = commonName[len(commonName)-maxCertCommonNameLen:]
-	}
-
+	// The subject stays empty: the mesh refuses an SVID request that names a subject CN, so no
+	// requester can obtain an entity-CA certificate naming a host, and it takes the identity from
+	// its own registration into the URI SAN.
 	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
-		Subject:            pkix.Name{CommonName: commonName},
 		SignatureAlgorithm: x509.ECDSAWithSHA256,
 	}, privateKey)
 	if err != nil {
-		return nil, nil, fmt.Errorf("building the CSR failed for a %d-byte common name: %w", len(commonName), err)
+		return nil, nil, fmt.Errorf("building the CSR failed: %w", err)
 	}
 	return privateKey, csrDER, nil
 }
